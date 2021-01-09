@@ -1,2 +1,8 @@
-# go-ds4-input
-DualShock 4 driver for GoLang
+# go-js-input
+
+GamePad driver for GoLang
+
+Supported gamepads:
+
+- [*] DualShock 4
+- [] XBox One Controller 
