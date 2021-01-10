@@ -13,28 +13,54 @@ import (
 )
 
 func main() {
-	events := make(chan reader.Event)
-	errorsCh := make(chan error)
 
+	// Create context with deadline
 	ctx, cancelFn := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
-	err := reader.NewEventReader(ctx, "/dev/input/js0", events, errorsCh)
+
+	// Open input device
+	fp, err := os.Open("/dev/input/js0")
 	if err != nil {
 		println(err.Error())
 		return
 	}
+	defer fp.Close()
 
+	// Initializing event reader
+	inputEventReader := reader.NewInputEventReader(fp, time.Duration(time.Millisecond*10))
+
+	// Closes event reader's channels and file descriptors at the end
+	defer inputEventReader.Close()
+
+	// Starts listening to input events
+	go inputEventReader.ListenEvents(ctx)
+
+	// Processing CTRL+C signal
 	signalCh := make(chan os.Signal)
+	defer close(signalCh)
 	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+
+	// Gets channels with events and errors. To prevent blocking, both channels must be read
+	eventsCh, errorsCh := inputEventReader.GetChannels()
 
 mainLoop:
 	for {
 		select {
-		case event := <-events:
+		// Reads input events
+		case event, open := <-eventsCh:
+			if !open {
+				continue
+			}
+
 			fmt.Printf("%#v\n", event)
-		case err := <-errorsCh:
+		// Read error events
+		case err, open := <-errorsCh:
+			if !open {
+				continue
+			}
 			cause := errors.Cause(err)
 			switch cause.(type) {
-			case *os.PathError:
+			// Ignores read deadline errors
+			case reader.ErrorReadDeadline:
 				continue
 			}
 			cancelFn()
@@ -45,8 +71,4 @@ mainLoop:
 			break mainLoop
 		}
 	}
-
-	close(events)
-	close(errorsCh)
-	close(signalCh)
 }

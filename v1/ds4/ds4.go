@@ -8,38 +8,81 @@ import (
 	"github.com/xpr0ger/go-js-input/v1/reader"
 )
 
+//InputEventProvider provides interface to get events channels
+type InputEventProvider interface {
+	ListenEvents(ctx context.Context)
+	GetChannels() (<-chan reader.InputEvent, <-chan error)
+	Close() error
+}
+
+//DS4EventAdapter input events adapter for the DualShock 4 gamepad
 type DS4EventAdapter struct {
+	eventsProvider InputEventProvider
+
 	dPadUp    bool
 	dPadRight bool
 	dPadDown  bool
 	dPadLeft  bool
+
+	gamePadEventsCh chan controller.GamePadEvent
+	errorsCh        chan error
 }
 
-func NewDS4EventAdapter(ctx context.Context, rawEvents chan reader.Event, errorsCh chan error) chan controller.GamePadEvent {
-	adapter := &DS4EventAdapter{}
-	events := make(chan controller.GamePadEvent)
-	go adapter.Run(ctx, rawEvents, events, errorsCh)
-	return events
+//NewDS4EventAdapter DS4EventAdapter's constructor
+func NewDS4EventAdapter(eventsProvider InputEventProvider) *DS4EventAdapter {
+	adapter := &DS4EventAdapter{
+		eventsProvider:  eventsProvider,
+		gamePadEventsCh: make(chan controller.GamePadEvent),
+		errorsCh:        make(chan error),
+	}
+	return adapter
 }
 
-func (d *DS4EventAdapter) Run(ctx context.Context, rawEvents chan reader.Event, events chan controller.GamePadEvent, errorsCh chan error) {
+// Close Closes all open channels and descriptors to avoid memory leaks call this function at the end of the program
+func (d *DS4EventAdapter) Close() error {
+	close(d.gamePadEventsCh)
+	close(d.errorsCh)
+	return d.eventsProvider.Close()
+}
+
+// GetChannels provides the gamepad specific input events channel and errors channel. A user must read from both channels to prevent an
+// event processing block. Before use channels - call the ListenEvents function
+func (d *DS4EventAdapter) GetChannels() (<-chan controller.GamePadEvent, <-chan error) {
+	return d.gamePadEventsCh, d.errorsCh
+}
+
+// ListenEvents starts to listen to the input events and convert them to gamepad specific
+func (d *DS4EventAdapter) ListenEvents(ctx context.Context) {
+	go d.eventsProvider.ListenEvents(ctx)
+	eventCh, errorsCh := d.eventsProvider.GetChannels()
 eventLoop:
 	for {
 		select {
 		case <-ctx.Done():
 			break eventLoop
-		case rawEvent := <-rawEvents:
-			event, err := d.ConvertEvent(rawEvent)
-			if err != nil {
-				errorsCh <- err
+		case rawEvent, open := <-eventCh:
+			if !open {
 				continue
 			}
-			events <- event
+
+			event, err := d.ConvertEvent(rawEvent)
+			if err != nil {
+				d.errorsCh <- err
+				continue
+			}
+			d.gamePadEventsCh <- event
+		case err, open := <-errorsCh: // Redirect errors
+			if !open {
+				continue
+			}
+
+			d.errorsCh <- err
 		}
 	}
 }
 
-func (d *DS4EventAdapter) ConvertEvent(event reader.Event) (controller.GamePadEvent, error) {
+//ConvertEvent convert input event to gamepad specific event
+func (d *DS4EventAdapter) ConvertEvent(event reader.InputEvent) (controller.GamePadEvent, error) {
 	gamePadEvent := controller.GamePadEvent{EventTime: event.Time}
 
 	//DPad Up
@@ -228,11 +271,12 @@ func (d *DS4EventAdapter) ConvertEvent(event reader.Event) (controller.GamePadEv
 		return gamePadEvent, nil
 	}
 
-	return gamePadEvent, controller.NewUnknownGamePadEvent(fmt.Errorf("unknown gamepad event %#v", event))
+	return gamePadEvent, controller.NewErrorUnknownGamePadEvent(fmt.Errorf("unknown gamepad event %#v", event))
 }
 
+//Max value 65534
 func (d *DS4EventAdapter) fixTriggerValue(val int) int {
-	correctionValue := 0xffff/2 + 1
+	correctionValue := 0xffff / 2
 	return val + correctionValue
 
 }

@@ -1,66 +1,109 @@
 package controller
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 type ButtonType int
 
+// GamepadEventProvider provides interface to get gamepad specific events channels
+type GamepadEventProvider interface {
+	ListenEvents(ctx context.Context)
+	GetChannels() (<-chan GamePadEvent, <-chan error)
+	Close() error
+}
+
+// GamePadEvent describes singe gamepad's event
 type GamePadEvent struct {
 	EventTime  uint32
 	ButtonType ButtonType
 	Value      int
 }
 
-type UnknownGamePadEvent struct {
+// ErrorUnknownGamePadEvent emits on unknown gamepad event
+type ErrorUnknownGamePadEvent struct {
 	error
 }
 
-func NewUnknownGamePadEvent(err error) error {
-	return UnknownGamePadEvent{error: err}
-}
+// NewErrorUnknownGamePadEvent - ErrorUnknownGamePadEvent's constructor
+func NewErrorUnknownGamePadEvent(err error) error { return ErrorUnknownGamePadEvent{error: err} }
 
+// GamePadState stores a current gamepad state
 type GamePadState struct {
-	updatedCh chan struct{}
-	lastEvent GamePadEvent
-	state     map[ButtonType]int
+	lastError            error
+	gamepadEventProvider GamepadEventProvider
+	updatedCh            chan struct{}
+	lock                 sync.RWMutex
+	lastEvent            GamePadEvent
+	state                map[ButtonType]int
 }
 
-func NewGampadState(ctx context.Context, eventsCh chan GamePadEvent) *GamePadState {
+// NewGampadState GampadState's constructor
+func NewGampadState(gamepadEventProvider GamepadEventProvider) *GamePadState {
 	gamePadState := &GamePadState{
-		updatedCh: make(chan struct{}),
-		state:     make(map[ButtonType]int),
+		gamepadEventProvider: gamepadEventProvider,
+		updatedCh:            make(chan struct{}),
+		state:                make(map[ButtonType]int),
 	}
-
-	go gamePadState.eventLoop(ctx, eventsCh)
 
 	return gamePadState
 }
 
+// GetEventUpdatedChannel on every update this channel gets notification
 func (g *GamePadState) GetEventUpdatedChannel() <-chan struct{} {
 	return g.updatedCh
 }
 
+// GetLastEvent gets the latest gamepad event
 func (g *GamePadState) GetLastEvent() GamePadEvent {
+	g.lock.RLock()
+	defer g.lock.RUnlock()
 	return g.lastEvent
 }
 
+// GetButtonState get specific button state see ds4/buttons.go
 func (g *GamePadState) GetButtonState(buttonType ButtonType) int {
+	g.lock.RLock()
+	defer g.lock.RUnlock()
 	return g.state[buttonType]
 }
 
-func (g *GamePadState) eventLoop(ctx context.Context, eventsCh chan GamePadEvent) {
+// Close Closes all open channels and descriptors to avoid memory leaks call this function at the end of the program
+func (g *GamePadState) Close() error {
+	close(g.updatedCh)
+	return g.gamepadEventProvider.Close()
+}
+
+// ListenEvents starts to listen to the input events
+func (g *GamePadState) ListenEvents(ctx context.Context) {
+	go g.gamepadEventProvider.ListenEvents(ctx)
+	gamepadEventsCh, errorsCh := g.gamepadEventProvider.GetChannels()
+
 eventLoop:
 	for {
 		select {
 		case <-ctx.Done():
-			close(g.updatedCh)
 			break eventLoop
-		case event := <-eventsCh:
+		case event, open := <-gamepadEventsCh:
+			if !open {
+				continue
+			}
+			g.lock.Lock()
 			g.lastEvent = event
 			g.state[event.ButtonType] = event.Value
+			g.lock.Unlock()
+
 			select {
 			case g.updatedCh <- struct{}{}:
 			default:
 			}
+		case err, open := <-errorsCh:
+			if !open {
+				continue
+			}
+
+			g.lastError = err
 		}
 	}
 }
